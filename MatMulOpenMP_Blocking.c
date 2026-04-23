@@ -1,4 +1,5 @@
-#define n 5000
+#define n 10000
+#define block_size 32
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,15 +26,22 @@ int main(int argc,char **argv) {
         }
     double t0= omp_get_wtime();
     
-    #pragma omp parallel for  schedule(static)
-    // each thread gets different rows of c
-    // no two threads update the same c[i][j] element, so no need for synchronization
-    // i, j, k are private by default in OpenMP
-    // No reduction atomic, or critical sections are needed because each thread works on a distinct portion of the output matrix c
-    for (i=0; i<n; ++i)
-        for (k=0; k<n; k++)
-            for (j=0; j<n; ++j)
-            c[i][j] += a[i][k]*b[k][j];
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int ii = 0; ii < n; ii += block_size) {
+        for (int jj = 0; jj < n; jj += block_size) {
+            for (int kk = 0; kk < n; kk += block_size) {
+                for (int i = ii; i < ii + block_size && i < n; i++) {
+                    for (int k = kk; k < kk + block_size && k < n; k++) {
+                        double aik = a[i][k];
+                        for (int j = jj; j < jj + block_size && j < n; j++) {
+                            c[i][j] += aik * b[k][j];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     double t1 = omp_get_wtime();
     printf("First bottleneck: %f seconds \n ", t1 - t0);
     

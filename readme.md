@@ -37,3 +37,8 @@ advixe-gui
 1. icx Matmul.c -O3 -o Matmul:
 *   First bottleneck: 50.1430
 *   Second bottleneck: 
+
+# OpenMP experiments
+## OpenMP ICC XHost on 10000 samples
+*   43.569727
+*   0.132649
