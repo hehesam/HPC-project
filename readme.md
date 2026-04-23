@@ -42,3 +42,6 @@ advixe-gui
 ## OpenMP ICC XHost on 10000 samples
 *   43.569727
 *   0.132649
+
+google docs link
+https://docs.google.com/document/d/1qt4il0NrqpDt9coAq8w0jO6MP3vAU-j10cAJX2-bWlo/edit?usp=sharing
