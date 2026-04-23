@@ -42,6 +42,31 @@ advixe-gui
 ## OpenMP ICC XHost on 10000 samples
 *   43.569727
 *   0.132649
+## OpenMP ICC XHost with Blocking
+1. 24 threads
+*   14.362156
+*   0.130031
+2. 32 threads
+*   15.616791
+*   0.135189
+3. 8 threads:
+*   23.192564
+*   0.133868
+4. 12 threads:
+*   21.446184
+*   0.132584
+5. 16 threads:
+*   17.905209
+*   0.13265
+## OpenMP ICC  XHost with blocking with different schedulees
+1. dynamic
+*   15.04
+2. Guided
+*   15.536664
+3. Static:
+*   1 chunck size: 14.45
+*   4 chunck size: 14.402
+*   16 chunck size: 14.4022041
 
 google docs link
 https://docs.google.com/document/d/1qt4il0NrqpDt9coAq8w0jO6MP3vAU-j10cAJX2-bWlo/edit?usp=sharing
