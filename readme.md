@@ -29,6 +29,9 @@ advixe-gui
 2. Runnign for n = 10000:
 *   First bottleneck: 365.593128
 *   second
+3. Runnign n=10000 with blocking:
+*   First bottleneck: 149.125418
+*   Second bottleneck: 0.132787
 
 # Third experiment with ICX compiler:
 1. icx Matmul.c -O3 -o Matmul:
