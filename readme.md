@@ -1,3 +1,9 @@
+*    CPU Name: 12th Gen Intel(R) Core(TM) i9-12900K
+*    Frequency: 3.20 GHz
+*    Logical CPU Count: 24
+*    Operating System: Linux
+*    Computer Name: wk005
+
 ## set up for compiler:
 source /opt/intel/oneapi/setvars.sh
 
