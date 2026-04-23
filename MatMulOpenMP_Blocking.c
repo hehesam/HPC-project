@@ -65,7 +65,7 @@ int main(int argc,char **argv) {
     double t1 = omp_get_wtime();
     printf("Second bottleneck: %f seconds \n ", t1 - t0);
 
-
+    // test
     fclose(f);
 
     free(a);
