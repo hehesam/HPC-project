@@ -1,8 +1,8 @@
-#define n 5000
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <mpi.h>
+#define n 10000
 
 #define TAG_A 100
 #define TAG_B 200
@@ -14,7 +14,10 @@ int main(int argc, char **argv) {
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
+    printf("Total number of processes running in the program: %d \n",size);
+    printf("processes rank: %d \n",rank);
 
+    // deciding how many rows each process gets
     int base = n / size;
     int rem  = n % size;
     int local_rows = base + (rank < rem ? 1 : 0);
@@ -26,10 +29,12 @@ int main(int argc, char **argv) {
     double (*local_A)[n] = malloc(local_rows * sizeof(*local_A));
     double (*local_C)[n] = malloc(local_rows * sizeof(*local_C));
 
-    if (!B || !local_A || !local_C) { // Check for malloc failures
+    if (!B || !local_A || !local_C) { // check for malloc failures
         fprintf(stderr, "Rank %d: malloc failed for local buffers\n", rank);
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
+    
+    // Every entry is sequentially initialized by process rank 0
 
     if (rank == 0) {
         A = malloc(sizeof(double[n][n]));
@@ -47,16 +52,14 @@ int main(int argc, char **argv) {
             }
         }
     }
-
+    // each process initializes a local output buffer
     for (int i = 0; i < local_rows; i++) {
         for (int j = 0; j < n; j++) {
             local_C[i][j] = 0.0;
         }
     }
 
-    /* -----------------------------
-       MANUAL DISTRIBUTION PHASE
-       ----------------------------- */
+    // manual distribution instead of scatterv
     if (rank == 0) {
         int row_offset = 0;
 
@@ -92,9 +95,7 @@ int main(int argc, char **argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double t0 = MPI_Wtime();
 
-    /* -----------------------------
-       LOCAL COMPUTATION
-       ----------------------------- */
+    // local computation
     for (int i = 0; i < local_rows; i++) {
         for (int k = 0; k < n; k++) {
             double aik = local_A[i][k];
@@ -125,7 +126,7 @@ int main(int argc, char **argv) {
         /* receive worker results */
         for (int src = 1; src < size; src++) {
             int rows_src = base + (src < rem ? 1 : 0);
-
+            // Recv instead of gatherv
             MPI_Recv(&C[row_offset][0], rows_src * n, MPI_DOUBLE,
                      src, TAG_C, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
