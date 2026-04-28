@@ -74,5 +74,30 @@ advixe-gui
 *   4 chunck size: 14.402
 *   16 chunck size: 14.4022041
 
+# Fourth Experiment MPI
+## using 4 process
+1. mpicc -o0 matmulMPI.c -o matmulMPI
+*   MPI MatMul time: 350.651494
+2. mpicc -O3 matmulMPI.c -o matmulMPI
+*   MPI MatMUl time: 153.825133 
+3. mpiicc -O3 MatMul_mpi.c -o matmul_mpi
+*   MPI MatMul time: 149.639843
+## Using 6 process
+1. mpicc -O3 matmulMPI.c -o matmulMPI
+*   MPI MatMUl time: 132.483944
+2. mpiicc -O3 matmulMPI.c -o matmulMPI
+*   MPI MatMul time: 132.483944
+
+## Using 12 process
+1. mpicc -O3 matmulMPI.c -o matmulMPI
+*   MPI MatMUl time: 128.832892
+2. mpiicc -O3 matmulMPI.c -o matmulMPI
+*   MPI MatMul time: 129.008329
+
+## ## Using 24 process
+1. mpicc -O3 matmulMPI.c -o matmulMPI
+*   MPI MatMUl time: 127.619324
+2. mpiicc -O3 matmulMPI.c -o matmulMPI
+*   MPI MatMul time: 127.588329
 google docs link
 https://docs.google.com/document/d/1qt4il0NrqpDt9coAq8w0jO6MP3vAU-j10cAJX2-bWlo/edit?usp=sharing
