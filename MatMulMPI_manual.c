@@ -26,7 +26,7 @@ int main(int argc, char **argv) {
     double (*local_A)[n] = malloc(local_rows * sizeof(*local_A));
     double (*local_C)[n] = malloc(local_rows * sizeof(*local_C));
 
-    if (!B || !local_A || !local_C) {
+    if (!B || !local_A || !local_C) { // Check for malloc failures
         fprintf(stderr, "Rank %d: malloc failed for local buffers\n", rank);
         MPI_Abort(MPI_COMM_WORLD, 1);
     }

@@ -94,10 +94,19 @@ advixe-gui
 2. mpiicc -O3 matmulMPI.c -o matmulMPI
 *   MPI MatMul time: 129.008329
 
-## ## Using 24 process
+## Using 24 process
 1. mpicc -O3 matmulMPI.c -o matmulMPI
 *   MPI MatMUl time: 127.619324
 2. mpiicc -O3 matmulMPI.c -o matmulMPI
 *   MPI MatMul time: 127.588329
-google docs link
+
+# Fifth experiment MPI with manual distribution
+## using 4 process
+1. mpicc -O3 matmulMPI_M.c -o matmulMPI_M
+*    MPI MatMul time: 149.708280
+## using 12 process
+2. mpicc -O3 matmulMPI_M.c -o matmulMPI_M
+*   MPI MatMul time: 129.220255
+
+google docs link   
 https://docs.google.com/document/d/1qt4il0NrqpDt9coAq8w0jO6MP3vAU-j10cAJX2-bWlo/edit?usp=sharing
