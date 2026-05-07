@@ -108,5 +108,57 @@ advixe-gui
 2. mpicc -O3 matmulMPI_M.c -o matmulMPI_M
 *   MPI MatMul time: 129.220255
 
+# Sixth experiment MPI with blocking size 32
+## using 4 processes
+1. mpicc -03 matmulMPI_blocked.c -o matmulMPI_blocked
+*   MPI MatMul time: 167.260305
+2. mpicc -O3 -march=native matmulMPI_blocked.c -o matmulMPI_blocked
+*  MPI MatMul time: 136.783163
+## using 6 processes
+2. mpicc -O3 -march=native matmulMPI_blocked.c -o matmulMPI_blocked
+*  MPI MatMul time: 103.555656
+
+## using 12 processes
+1. mpicc -O3 -march=native matmulMPI_blocked.c -o matmulMPI_blocked
+*  MPI MatMul time: 61.425365
+
+## using 24 processes
+2. mpicc -O3 -march=native matmulMPI_blocked.c -o matmulMPI_blocked
+*  MPI MatMul time: 42.879329
+
+# Seventh experiment MPI with blocking size 16
+## using 4 processes
+1. mpicc -03 matmulMPI_blocked.c -o matmulMPI_blocked
+*   MPI MatMul time: 17.202243
+## using 6 processes
+1. mpicc -03 matmulMPI_blocked.c -o matmulMPI_blocked
+*   MPI MatMul time: 13.730352
+## using 12 processes
+1. mpicc -03 matmulMPI_blocked.c -o matmulMPI_blocked
+*   MPI MatMul time: 15.947626
+## using 24 processes
+1. mpicc -03 matmulMPI_blocked.c -o matmulMPI_blocked
+*   MPI MatMul time: 24.157838
+## using 32 processes
+1. mpicc -03 matmulMPI_blocked.c -o matmulMPI_blocked
+*   MPI MatMul time: 24.167000
+
+# eighth experiment MPI with blocking size 8
+## using 4 processes
+1. mpicc -03 matmulMPI_blocked.c -o matmulMPI_blocked
+*   MPI MatMul time: 19.969668
+## using 6 processes
+1. mpicc -03 matmulMPI_blocked.c -o matmulMPI_blocked
+*   MPI MatMul time: 17.550283
+## using 12 processes
+1. mpicc -03 matmulMPI_blocked.c -o matmulMPI_blocked
+*   MPI MatMul time: 19.957171
+## using 24 processes
+1. mpicc -03 matmulMPI_blocked.c -o matmulMPI_blocked
+*   MPI MatMul time: 16.524702
+## using 32 processes
+1. mpicc -03 matmulMPI_blocked.c -o matmulMPI_blocked
+*   MPI MatMul time: 17.967706
+
 google docs link   
 https://docs.google.com/document/d/1qt4il0NrqpDt9coAq8w0jO6MP3vAU-j10cAJX2-bWlo/edit?usp=sharing
