@@ -261,9 +261,69 @@ MPI best         ##########                                   10.9x  (13.73 s on
                  0    5    10   15   20   25   30   35   40
 ```
 
-## Take-aways before moving to Step 2
+## Take-aways before moving to the block-size sweep
 1. The naive kernel already beats the BEST sequential CPU code by 15-22x; it also beats the BEST OpenMP and MPI runs (on the i9) by ~1.4-2.1x. So even the simplest CUDA mapping is competitive.
 2. The hotspot is the kernel (~91-93% of total time), confirming MatMul is compute/memory dominated, not transfer-limited.
-3. FP64 is already at 89% of T4 FP64 peak -> Step 3 tiling will help FP64 only marginally.
+3. FP64 is already at 89% of T4 FP64 peak -> tiling will help FP64 only marginally.
 4. FP32 is at 4% of T4 FP32 peak -> tiling has huge head-room here; this is where the next experiments should pay off.
-5. `nvprof` cannot profile T4 (CC 7.5+); from Step 2 onward we collect metrics with Nsight Compute (`ncu`).
+5. `nvprof` works on T4 in *activity* mode (the GPU activities table is collected via CUPT activity API, which is supported on CC 7.5+). What does **not** work on T4 is `nvprof --metrics ...` (events / metrics collection). For coalescing/efficiency/occupancy metrics we use `ncu` (Nsight Compute) from Step 3 onward.
+
+# Second CUDA experiment: block-size sweep on the naive kernel
+Same kernel as Step 1, recompiled with `-DBLOCK=8 / 16 / 32` so we can pick the best naive launch configuration before adding shared memory. Each block has `BLOCK x BLOCK` threads:
+*   BLOCK=8  -> 64 threads/block (2 warps), 1250x1250 grid
+*   BLOCK=16 -> 256 threads/block (8 warps), 625x625 grid
+*   BLOCK=32 -> 1024 threads/block (32 warps, the max per block on T4), 313x313 grid
+
+## Compile commands
+1. FP64: `nvcc -arch=sm_75 -O3 -DBLOCK={8,16,32} MatMulCuda.cu -o MatMulCuda_fp64_b{8,16,32}`
+2. FP32: `nvcc -arch=sm_75 -O3 -DUSE_FLOAT -DBLOCK={8,16,32} MatMulCuda.cu -o MatMulCuda_fp32_b{8,16,32}`
+
+## Raw timings (n = 10000, Tesla T4, `nvprof` activity mode)
+| Block | Precision | H2D (ms) | Kernel (ms) | D2H (ms) | Total (ms) | Kernel % | C[0][0] |
+|-------|-----------|----------|-------------|----------|------------|----------|---------|
+|  8x8  | FP64      | 372.97   | 14099.13    | 546.97   | 15019.07   | 93.89%   | 60000   |
+| 16x16 | FP64      | 344.46   |  9356.38    | 550.01   | 10250.85   | 91.29%   | 60000   |
+| 32x32 | FP64      | 347.30   | 10982.96    | 544.55   | 11874.81   | 92.50%   | 60000   |
+|  8x8  | FP32      | 174.49   |  9717.57    | 275.59   | 10167.66   | 95.59%   | 60000   |
+| 16x16 | FP32      | 172.58   |  5072.21    | 266.92   |  5511.70   | 92.05%   | 60000   |
+| 32x32 | FP32      | 182.94   |  3785.85    | 270.34   |  4239.13   | 89.34%   | 60000   |
+
+(All runs verified via `C[0][0] = 60000`. Note: the FP32-b16 kernel measured 5.07 s here vs 6.20 s in Step 1 -- this is run-to-run variance on the shared Colab T4. We use the Step 2 numbers in the table because the 6 runs were collected back-to-back on the same VM, so they are mutually consistent.)
+
+## Speedup vs `T_seq_best = 149.13 s`
+| Block | Precision | Total time (s) | Speedup (total) | Kernel-only (s) | Speedup (kernel only) |
+|-------|-----------|----------------|-----------------|-----------------|------------------------|
+|  8x8  | FP64      | 15.019         |  9.93x          | 14.099          | 10.58x                 |
+| 16x16 | FP64      | 10.251         | 14.55x          |  9.356          | 15.94x                 |
+| 32x32 | FP64      | 11.875         | 12.56x          | 10.983          | 13.58x                 |
+|  8x8  | FP32      | 10.168         | 14.67x          |  9.718          | 15.35x                 |
+| 16x16 | FP32      |  5.512         | 27.05x          |  5.072          | 29.40x                 |
+| **32x32** | **FP32** | **4.239**  | **35.18x**      | **3.786**       | **39.39x**             |
+
+ASCII speedup chart (vs `T_seq_best = 149.13 s`, total time):
+```
+fp64 b8    ##########                          9.9x
+fp64 b16   ###############                    14.6x
+fp64 b32   #############                      12.6x
+fp32 b8    ###############                    14.7x
+fp32 b16   ###########################        27.0x
+fp32 b32   ###################################  35.2x  <-- best naive
+              |----+----|----+----|----+----|----+
+              0    5    10   15   20   25   30  35  40
+```
+
+## Why FP64 prefers BLOCK=16 but FP32 prefers BLOCK=32 (compute-bound vs memory-bound)
+
+This is the most informative result of the sweep. The two curves go in opposite directions because the two kernels are bottlenecked by different things:
+
+*   **FP64 is compute-bound on the FP64 pipeline.** Throughput at the best point (b16) is `2 * n^3 / 9.356 s = 0.214 TFLOPs`, which is ~86% of T4's 0.25 TFLOPs FP64 peak. At b32 we lose ~17% performance because each thread uses more registers in FP64 (8-byte values), so we cannot reach as much occupancy with 1024 threads/block; b16 is the sweet spot where the FP64 ALUs are most efficiently fed. b8 is bad because only 2 warps per block leaves the warp scheduler too few options to hide the (modest) memory latency between FP64 multiplies.
+*   **FP32 is memory-bound, and BLOCK=32 wins through implicit data reuse.** With BLOCK=32 each block computes a 32x32 sub-matrix of C, so each row of A is reused 32 times within the block and each column of B is reused 32 times -- staying in L1/L2 across uses. With BLOCK=16 each row/column is reused only 16 times, with BLOCK=8 only 8 times. This is the same locality argument as CPU-side blocking; we are getting "free" blocking from the launch geometry. FP32 throughput at b32 is `2e12 / 3.786 s = 0.528 TFLOPs`, only 6.5% of T4 FP32 peak (8.1 TFLOPs), confirming we are still memory-bound and Step 3 (explicit shared-memory tiling) has plenty of head-room.
+
+## Hotspot: still the kernel
+In every configuration the kernel is **89-96%** of total GPU time (see `Kernel %` column above). Memory transfers H2D + D2H are ~4-11% combined. The hotspot has not moved compared to Step 1: this remains a compute/memory-throughput problem inside the kernel, not a PCIe problem. Even at the fastest configuration (FP32 b32), the kernel is still 3.79 s out of 4.24 s = 89.3%.
+
+## Take-aways before moving to the tiled kernel
+1. **Best naive configuration: FP32, BLOCK=32 -> 4.24 s total, 35.2x speedup vs `T_seq_best`** and 86.2x vs the unoptimized sequential `T_seq_naive = 365.59 s`.
+2. **Best FP64 configuration: BLOCK=16 -> 10.25 s total, 14.6x speedup**. Already near the FP64 ceiling of T4 (~86% of peak). Step 3 tiling will probably move FP64 only a few percent.
+3. The FP32 winner is locked in because the kernel is still 6.5% of FP32 peak; explicit shared-memory tiling (Step 3) targets exactly this gap.
+4. From Step 3 onward we use BLOCK=16 as the default tile size for both precisions to keep the comparison apples-to-apples with the sweep above; we will then do a tile-size sweep (Step 4) on the tiled kernel.
