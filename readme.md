@@ -497,3 +497,117 @@ Kernel share dropped from ~92% to **80.79% in the FP32 t32 winner** -- not becau
 2. **FP64 is locked at ~93% of T4 FP64 peak, both for TILE=16 and TILE=32.** No further hand-written kernel will move it without using tensor cores (which the T4 supports for FP64 only via WMMA + Turing limitations and is outside the "human-readable, simple" scope).
 3. **FP32 still has head-room to ~8x** (we are at 11.5% of FP32 peak). Closing that gap requires register tiling (each thread computes a `m x n` micro-tile of C, holding C values in registers across the full k-loop), which is exactly what cuBLAS does. Step 5 will show what we leave on the table by stopping at single-tile blocking.
 4. The TILE=32 result is at n=9984; we will use the *scaled* values (56.17x total, 69.56x kernel-only) when we put the final summary table together so all rows are on the same axis.
+
+# Fifth CUDA experiment: cuBLAS Sgemm / Dgemm (practical upper bound)
+This step is not a hand-written kernel; it calls NVIDIA's cuBLAS library, which uses **register tiling on top of shared-memory tiling** plus assembly-level scheduling. We use it as a **practical upper bound** -- it tells us how much head-room we leave on the table by stopping at single-tile shared-memory blocking. The host code [Cuda/MatMulCublas.cu](Cuda/MatMulCublas.cu) is intentionally minimal and uses the standard column-major-of-the-transpose trick to feed the same row-major matrices we used in Steps 1-4.
+
+A warm-up `gemm` call is run once before the timed call, because cuBLAS lazy-JIT-compiles its kernel on the first invocation; without the warm-up that one-off compile cost (often hundreds of ms on Colab) would land in our timing window.
+
+## Compile commands (note `-lcublas`)
+1. FP64: `nvcc -arch=sm_75 -O3            MatMulCublas.cu -o MatMulCublas_fp64 -lcublas`
+2. FP32: `nvcc -arch=sm_75 -O3 -DUSE_FLOAT MatMulCublas.cu -o MatMulCublas_fp32 -lcublas`
+
+## Raw timings (n = 10000, Tesla T4, after warm-up, `nvprof` activity mode)
+| Phase     | FP64 (cuBLAS Dgemm) | FP32 (cuBLAS Sgemm) |
+|-----------|---------------------|---------------------|
+| H2D copy  |    358.06 ms        |    190.87 ms        |
+| Kernel    |   7984.25 ms        |   **418.40 ms**     |
+| D2H copy  |    552.51 ms        |    324.79 ms        |
+| **Total** |  **8894.8 ms**      |  **934.06 ms**      |
+| `C[0][0]` | 60000.000           | 60000.000           |
+
+cuBLAS picks the kernel `volta_dgemm_128x64_nn` (FP64) and `volta_sgemm_128x64_nn` (FP32) -- 128x64 register-tile macro-kernels for Volta/Turing. The `nvprof` GPU activity table shows **two** kernel calls (warm-up + timed) of ~equal length, totalling 16.05 s for FP64 and 857 ms for FP32; we report the second (timed) one in the table above.
+
+## Speedup vs `T_seq_best = 149.13 s`
+| Variant      | Total (s) | Speedup (total) | Kernel (s) | Speedup (kernel) |
+|--------------|-----------|-----------------|------------|-------------------|
+| FP64 cuBLAS  | 8.895     | 16.77x          | 7.984      | 18.68x            |
+| **FP32 cuBLAS** | **0.934** | **159.66x** | **0.418**  | **356.55x**       |
+
+`Sgemm` total time is **934 ms** -- under one second to multiply two `10000 x 10000` matrices.
+
+## Effective TFLOPs and percentage of T4 peak
+| Variant     | Useful TFLOPs (kernel) | % of T4 peak               |
+|-------------|-------------------------|----------------------------|
+| FP64 cuBLAS | 0.251                   | **100% of FP64 peak (0.25)** -- at the hardware ceiling |
+| FP32 cuBLAS | 4.781                   | **59% of FP32 peak (8.1)** -- compute-bound, no longer memory-bound |
+
+For comparison, the best hand-written kernel was 0.231 TFLOPs (FP64 tiled t16, 92% of peak) and 0.933 TFLOPs (FP32 tiled t32, 11.5% of peak). The FP32 jump from 11.5% -> 59% of peak is the cost of the optimisations we deliberately chose **not** to implement.
+
+## Nsight Compute -- the optimisation gap, quantified
+The most informative single comparison is FP32 ours (TILE=16, where ncu numbers were collected in Step 3) versus FP32 cuBLAS Sgemm:
+
+| Metric                          | FP32 tiled (ours, TILE=16) | FP32 cuBLAS Sgemm           |
+|---------------------------------|-----------------------------|------------------------------|
+| Kernel name                     | `matmul_tiled`              | `volta_sgemm_128x64_nn`      |
+| Block size                      | 256 (16x16)                 | 128 (128x1)                  |
+| Registers per thread            | 38                          | **122**                      |
+| Static shared memory per block  | 2.05 KB                     | 12.54 KB                     |
+| Achieved occupancy              | 99.97%                      | **49.82%** (limited by regs) |
+| L1/TEX hit rate                 |  0.00%                      |  0.09%                       |
+| L2 hit rate                     | 48.66%                      | **87.23%**                   |
+| Memory throughput               | 100.5 GB/s                  | 47.8 GB/s                    |
+| % of peak DRAM bandwidth        | **78.6%**                   | 43.2%                        |
+| Mem Pipes Busy                  | 78.6%                       | 43.2%                        |
+| Useful TFLOPs (kernel only)     | 0.700                       | 4.781                        |
+
+What cuBLAS does differently:
+1. **Register tiling.** With 122 registers per thread, each thread privately accumulates a chunk of C (a `128x64 / 128 = 64`-element column slice for the 128x64 macro-kernel) in registers across the whole k-loop. Our kernel uses 38 registers per thread and accumulates only **one** C element. Register tiling raises arithmetic intensity per loaded byte by a factor of `M_reg * N_reg / (M_reg + N_reg)`; for a 128x64 macro-tile this is roughly 43, vs `TILE/2 = 8` for our 16x16 tile.
+2. **Deliberately low occupancy (50%).** Spending registers on a private C accumulator means fewer warps fit per SM -- exactly the trade-off Nsight flagged ("Block Limit Registers = 4 blocks/SM"). cuBLAS chose the right side of that trade-off because the kernel is no longer memory-bound at high occupancy: notice DRAM traffic dropped from 100.5 GB/s to 47.8 GB/s and L2 hit rate jumped from 48.7% to 87.2%, even though the kernel got 6x faster. We are doing far less DRAM traffic per FLOP.
+3. **128x1 launch shape.** A 128-thread "row" handles a 128x64 output tile -- this maps neatly to four warps loading B coalesced and computing in parallel. It is not a pretty `__global__` you can write in 30 lines; it is hand-tuned PTX/SASS.
+
+For FP64 the same techniques are applied (`volta_dgemm_128x64_nn`, 234 regs/thread, 25% occupancy) but the win shrinks to 7% because the FP64 ALU pipeline was already the bottleneck. Ncu confirms the FP64 cuBLAS kernel runs at only 2.6% of peak DRAM bandwidth -- DRAM is utterly idle, the FP64 ALUs are simply at their hard limit.
+
+## Hotspot
+For FP32 cuBLAS the kernel has shrunk so much that the **balance flips**: kernel = 45% of total GPU time (418 ms of 934 ms), H2D = 20%, D2H = 35%. We are starting to look like the `VectorAddCuda.cu` example -- transfers becoming a meaningful share. To eat into the remaining ~516 ms of transfer time we would need pinned host memory and/or stream overlap; that is the next research direction but is outside the scope here. For FP64 cuBLAS the kernel is still 90% of total -- transfers stay irrelevant because the kernel is huge.
+
+## Take-aways from cuBLAS
+1. **FP32 cuBLAS Sgemm reaches `159.66x` total speedup vs `T_seq_best`** -- by far the highest in the entire project. Kernel-only speedup is `356.55x`, and the kernel runs at 4.78 TFLOPs = 59% of T4 FP32 peak.
+2. **FP64 cuBLAS Dgemm is essentially tied with our hand-written tiled t16** (1.07x speedup), confirming that for FP64 on T4 our simple tiled kernel was already optimal modulo a few percent. Both run at ~100% of the FP64 hardware ceiling.
+3. The `5.10x` gap between our best hand-written FP32 kernel and cuBLAS is the price of stopping at single-tile shared-memory blocking. Closing that gap requires register tiling, which is a substantial increase in code complexity for a fixed-architecture optimisation -- a fair stopping point for a "human-readable, simple" implementation.
+
+# CUDA summary -- final consolidated speedup table
+
+All speedups below are computed against the BEST workstation sequential reference `T_seq_best = 149.13 s` (sequential `MatMulBlocking.c`, ICC -O3, n = 10000, i9-12900K). The CUDA times are measured on Google Colab's Tesla T4. **This is a cross-host comparison**: the GPU and CPU are not in the same machine. We report it because the same baseline is what we used for every OpenMP and MPI experiment in the readme, so all numbers in this project sit on the same axis.
+
+For each kernel/precision pair we report only the best configuration found (block size for the naive kernel; tile size for the tiled kernel). Times for n=9984 (FP32 tiled t32) are scaled to n=10000-equivalent by `(10000/9984)^3 = 1.00481`.
+
+| Implementation                    | Precision | Best config | Total (s)  | Kernel (s) | Speedup total | Speedup kernel | TFLOPs (kernel) | % of T4 peak |
+|-----------------------------------|-----------|-------------|------------|------------|---------------|-----------------|------------------|--------------|
+| Naive 2D-grid                     | FP64      | BLOCK=16    |  10.251    |   9.356    |  14.55x       |  15.94x         |  0.214           |  85.6%       |
+| Naive 2D-grid                     | FP32      | BLOCK=32    |   4.239    |   3.786    |  35.18x       |  39.39x         |  0.528           |   6.5%       |
+| Shared-memory tiled               | FP64      | TILE=16     |   9.548    |   8.559    |  15.62x       |  17.42x         |  0.234           |  93.6%       |
+| Shared-memory tiled               | FP32      | TILE=32     |   2.655(*) |   2.144(*) |  56.17x       |  69.56x         |  0.933           |  11.5%       |
+| **cuBLAS** Dgemm                  | **FP64**  | (vendor)    | **8.895**  | **7.984**  | **16.77x**    | **18.68x**      | **0.251**        | **100.0%**   |
+| **cuBLAS** Sgemm                  | **FP32**  | (vendor)    | **0.934**  | **0.418**  | **159.66x**   | **356.55x**     | **4.781**        | **59.0%**    |
+
+(*) FP32 tiled t32 timings scaled from raw n=9984 by `(10000/9984)^3 = 1.00481`.
+
+## CPU references for context (n = 10000, i9-12900K)
+| Implementation                    | Time (s) | Speedup vs `T_seq_best` |
+|-----------------------------------|----------|--------------------------|
+| Sequential, ICC -O3, no blocking  | 365.59   |  0.41x  (this is `T_seq_naive`, used as the worst case) |
+| Sequential, ICC -O3, with blocking| 149.13   |  1.00x  (this is `T_seq_best`, the reference) |
+| OpenMP best (24 threads, blocking)|  14.36   | 10.39x  |
+| MPI best (12 procs, blocking 16)  |  13.73   | 10.86x  |
+
+## Speedup chart vs `T_seq_best = 149.13 s` (total time)
+```
+seq O3 + blocking      #                                                           1.0x   (reference)
+OpenMP best            ##########                                                 10.4x
+MPI best               ##########                                                 10.9x
+CUDA naive   FP64      ##############                                             14.6x
+CUDA naive   FP32      ###################################                        35.2x
+CUDA tiled   FP64      ###############                                            15.6x
+CUDA cuBLAS  FP64      #################                                          16.8x
+CUDA tiled   FP32      ########################################################   56.2x
+CUDA cuBLAS  FP32      #####################################################################################################################################################  159.7x
+                       |----+----|----+----|----+----|----+----|----+----|----+----|----+----|----+----|----+----|----+----|----+----|----+----|----+----|----+----|----+----|
+                       0    10   20   30   40   50   60   70   80   90   100  110  120  130  140  150  160
+```
+
+## Closing remarks
+1. **The CUDA progression mirrors the CPU progression and reaches the same conclusions on different hardware.** "Compiler optimisation" -> Step 1 naive kernel; "blocking" -> Step 3 shared-memory tiled kernel; "best parallel" -> Step 5 cuBLAS. Each step adds an optimisation that targets the exact bottleneck identified by the previous step's profiling, and each step's improvement matches the prediction from arithmetic-intensity / roofline reasoning.
+2. **FP32 vs FP64 makes a 170x difference at the high end** (cuBLAS Sgemm 0.93 s vs cuBLAS Dgemm 8.90 s) on T4 because of its 32:1 FP32:FP64 ratio. For the original `MatMul.c` workload (which uses `double`) the practical CUDA speedup is **~16-19x** over the BEST sequential CPU run; for FP32 it is **~160x**. The choice of precision is a first-class design decision on this generation of GPU.
+3. **Cross-host caveat.** All speedups compare a Tesla T4 GPU against an i9-12900K CPU. They are honest in the sense that we are answering "if I had access to a T4, how much faster could I run my matmul vs what I get on my workstation today?", but they should not be interpreted as "GPUs are X-times faster than CPUs in general" -- a top-end Sapphire Rapids server CPU with AVX-512 would substantially close the gap, particularly for the hand-written CUDA kernels.
+4. **The hotspot has fully migrated.** In `MatMul.c` the hotspot was the triple loop (~91% of run time). In our naive CUDA kernel the hotspot was the kernel (~91% of GPU time). In our tiled CUDA kernel the hotspot stayed in the kernel but the kernel got 1.8-2x faster. In cuBLAS Sgemm the hotspot is now **PCIe transfers** (kernel = 45% of total GPU time) -- if we wanted to keep optimising, the next experiment would be pinned host memory + overlapped streams, not a faster gemm.
