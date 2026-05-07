@@ -1,37 +1,44 @@
-#define n 5000
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <mpi.h>
+#define n 10000
 
 int main(int argc, char **argv) {
-    MPI_Init(&argc, &argv);
+    MPI_Init(&argc, &argv); // initialization
 
     int rank, size;
+    // getting communicator size and rank
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
+    printf("Total number of processes running in the program: %d \n",size);
+    printf("processes rank: %d \n",rank);
 
+
+   
+    // deciding how many rows each process gets
     int base = n / size;
     int rem  = n % size;
     int local_rows = base + (rank < rem ? 1 : 0);
+    int *counts = malloc(size * sizeof(int)); // how many elements belong to process r
+    int *displs = malloc(size * sizeof(int)); // where that chunck starts in the full matrix buffer
 
-    int *counts = malloc(size * sizeof(int));
-    int *displs = malloc(size * sizeof(int));
-
+    // we fill the chunks
     int offset = 0;
     for (int r = 0; r < size; r++) {
         int rows_r = base + (r < rem ? 1 : 0);
-        counts[r] = rows_r * n;
+        counts[r] = rows_r * n; //each process receives a block of full rows, and each row has n doubles
         displs[r] = offset;
         offset += counts[r];
     }
+    // memory allocation
+    double (*A)[n] = NULL; // full matrix A only allocated on rank 0
+    double (*C)[n] = NULL; // full matrix C only allocated on rank 0
+    double (*B)[n] = malloc(sizeof(double[n][n])); // full matrix B allocated on every process --> row-wise matmult is where every row block of A must mult with all columns of B
+    double (*local_A)[n] = malloc(local_rows * sizeof(*local_A)); // local chunk of rows of A allocated on every process
+    double (*local_C)[n] = malloc(local_rows * sizeof(*local_C)); // local chunk of rows of C allocated on every process
 
-    double (*A)[n] = NULL;
-    double (*C)[n] = NULL;
-    double (*B)[n] = malloc(sizeof(double[n][n]));
-    double (*local_A)[n] = malloc(local_rows * sizeof(*local_A));
-    double (*local_C)[n] = malloc(local_rows * sizeof(*local_C));
-
+    // Every entry is sequentially initialized by process rank 0
     if (rank == 0) {
         A = malloc(sizeof(double[n][n]));
         C = malloc(sizeof(double[n][n]));
@@ -44,18 +51,21 @@ int main(int argc, char **argv) {
             }
     }
 
+    // each process initializes a local output buffer
     for (int i = 0; i < local_rows; i++)
         for (int j = 0; j < n; j++)
             local_C[i][j] = 0.0;
 
+    // distributing the ranks of A between processes
     MPI_Scatterv(rank == 0 ? &A[0][0] : NULL, counts, displs, MPI_DOUBLE,
                  &local_A[0][0], local_rows * n, MPI_DOUBLE,
                  0, MPI_COMM_WORLD);
 
+    // Sends the entire matrix B from rank 0 to all other processes
     MPI_Bcast(&B[0][0], n * n, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
-    MPI_Barrier(MPI_COMM_WORLD);
-    double t0 = MPI_Wtime();
+    MPI_Barrier(MPI_COMM_WORLD); // synchronize before timing (all processes have reached here)
+    double t0 = MPI_Wtime(); // for MPI we use wall-clock time
 
     for (int i = 0; i < local_rows; i++)
         for (int k = 0; k < n; k++) {
@@ -64,13 +74,13 @@ int main(int argc, char **argv) {
                 local_C[i][j] += aik * B[k][j];
         }
 
-    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Barrier(MPI_COMM_WORLD); // aynch all processes before gathering the result
     double t1 = MPI_Wtime();
 
     MPI_Gatherv(&local_C[0][0], local_rows * n, MPI_DOUBLE,
                 rank == 0 ? &C[0][0] : NULL, counts, displs, MPI_DOUBLE,
                 0, MPI_COMM_WORLD);
-
+    // rank o process writes the results to file
     if (rank == 0) {
         printf("MPI MatMul time: %f seconds\n", t1 - t0);
 
