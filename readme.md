@@ -327,3 +327,173 @@ In every configuration the kernel is **89-96%** of total GPU time (see `Kernel %
 2. **Best FP64 configuration: BLOCK=16 -> 10.25 s total, 14.6x speedup**. Already near the FP64 ceiling of T4 (~86% of peak). Step 3 tiling will probably move FP64 only a few percent.
 3. The FP32 winner is locked in because the kernel is still 6.5% of FP32 peak; explicit shared-memory tiling (Step 3) targets exactly this gap.
 4. From Step 3 onward we use BLOCK=16 as the default tile size for both precisions to keep the comparison apples-to-apples with the sweep above; we will then do a tile-size sweep (Step 4) on the tiled kernel.
+
+# Third CUDA experiment: shared-memory tiled kernel
+This is the GPU analogue of [MatMulBlocking.c](MatMulBlocking.c). Each thread block stages a `TILE x TILE` sub-block of A and of B into the SM's shared memory, every thread reuses each loaded element TILE times before the next tile is loaded, and global-memory traffic drops by a factor of TILE compared to the naive kernel. Default `TILE = 16` (256 threads/block, same launch geometry as naive `BLOCK=16`).
+
+The kernel ([Cuda/MatMulCudaTiled.cu](Cuda/MatMulCudaTiled.cu) lines 42-69):
+
+```42:69:Cuda/MatMulCudaTiled.cu
+__global__ void matmul_tiled(const real *A, const real *B, real *C, int n) {
+    __shared__ real As[TILE][TILE];
+    __shared__ real Bs[TILE][TILE];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int row = blockIdx.y * TILE + ty;
+    int col = blockIdx.x * TILE + tx;
+
+    real sum = 0;
+
+    // Walk over the tiles of A (along the row) and B (along the column).
+    for (int t = 0; t < n / TILE; ++t) {
+        // Cooperatively load one tile of A and one tile of B into shared memory.
+        // Each thread loads exactly one element of each tile.
+        As[ty][tx] = A[row * n + (t * TILE + tx)];
+        Bs[ty][tx] = B[(t * TILE + ty) * n + col];
+        __syncthreads();
+
+        // Multiply the two tiles using only shared-memory accesses.
+        #pragma unroll
+        for (int k = 0; k < TILE; ++k) {
+            sum += As[ty][k] * Bs[k][tx];
+        }
+        __syncthreads();
+    }
+
+    C[row * n + col] = sum;
+}
+```
+
+Launch: `dim3 block(16, 16); dim3 grid(625, 625);`. Shared memory per block: 4096 B (FP64) or 2048 B (FP32) -- the T4 has 96 KB shared-memory carve-out per SM, so this is a tiny fraction; occupancy is not limited by shared memory at this tile size.
+
+## Compile commands
+1. FP64: `nvcc -arch=sm_75 -O3            MatMulCudaTiled.cu -o MatMulCudaTiled_fp64_t16`
+2. FP32: `nvcc -arch=sm_75 -O3 -DUSE_FLOAT MatMulCudaTiled.cu -o MatMulCudaTiled_fp32_t16`
+
+## Raw timings (n = 10000, TILE = 16, Tesla T4, `nvprof` activity mode)
+| Phase     | FP64 (double) | FP32 (float)  |
+|-----------|---------------|---------------|
+| H2D copy  |    345.455 ms |    174.874 ms |
+| Kernel    |   8309.403 ms |   2593.284 ms |
+| D2H copy  |    641.945 ms |    279.510 ms |
+| **Total** | **9296.8 ms** | **3047.7 ms** |
+| Kernel %  |     89.40%    |     85.13%    |
+| `C[0][0]` | 60000.000     | 60000.000     |
+
+Both runs verified (`C[i][j] = 6 * n = 60000`).
+
+## Speedup of the tiled kernel
+*   **vs naive at the same launch geometry** (BLOCK=16): FP32 kernel `5072 -> 2593 ms`, **1.96x kernel speedup** (1.81x total). FP64 kernel `9356 -> 8309 ms`, **1.13x kernel speedup** (1.10x total).
+*   **vs the best naive run** (FP32 BLOCK=32, kernel 3786 ms): FP32 tiled t16 kernel = 2593 ms, **1.46x faster than the best naive**.
+*   **vs `T_seq_best = 149.13 s`**: FP64 tiled t16 total = 9.297 s -> **16.04x**. FP32 tiled t16 total = 3.048 s -> **48.93x** (kernel-only **57.51x**).
+
+## Nsight Compute metrics (TILE = 16)
+The ncu run is much slower than the timed run because ncu replays the kernel 8 times to collect different metric groups (43 s for FP32, 178 s for FP64); the timing numbers in the speedup table come from the `nvprof` run, not the ncu run.
+
+| Metric                          | FP64 tiled  | FP32 tiled  |
+|---------------------------------|-------------|-------------|
+| Memory throughput               | 37.85 GB/s  | 100.47 GB/s |
+| % of peak bandwidth (320 GB/s)  | 21.44%      | **78.61%**  |
+| L1/TEX hit rate                 |  0.00%      |  0.00%      |
+| L2 hit rate                     | 45.51%      | 48.66%      |
+| Mem Pipes Busy                  | 38.28%      | 78.61%      |
+| Theoretical / achieved occupancy| 100% / 99.99%| 100% / 99.97%|
+| Active warps per SM (max 32)    | 32.00       | 31.99       |
+| Registers / thread              | 44          | 38          |
+| Block-limit warps               | 4 blocks/SM | 4 blocks/SM |
+
+About the 0% L1/TEX hit rate: this is **expected and correct** for a shared-memory tiled kernel. Loads issued via `As[ty][tx]` and `Bs[k][tx]` go to the SM's shared-memory bank network, **not** through the L1/TEX cache, so by definition they cannot count as L1 hits. The reuse we wanted is happening in shared memory, where it is counted in the "Mem Pipes Busy" metric.
+
+## Why FP32 wins big and FP64 barely moves (compute-bound vs bandwidth-bound, confirmed)
+The Step 2 prediction is verified by hard numbers, not just timings:
+
+*   **FP32 tiled is bandwidth-bound at 78.6% of T4 peak DRAM throughput.** Tiling cut the traffic by a factor of TILE = 16 vs the naive kernel (each A and B element is now read once per tile-step, not n/TILE times). The kernel reaches `2 * n^3 / 2.593 s = 0.771 TFLOPs`, only 9.5% of FP32 peak (8.1 TFLOPs) -- **we are not compute-bound, we are memory-bound by DRAM bandwidth**. To break this ceiling we need to either reduce traffic further (Step 4 -- bigger tile, more reuse per byte) or accept that this is the practical ceiling for a hand-written single-tile-per-thread-block kernel.
+*   **FP64 tiled is compute-bound on the FP64 pipeline at 96% of FP64 peak.** Memory throughput is only 21% of bandwidth, so DRAM is not the issue. Tiling cut traffic, but the FP64 ALUs were already saturated, so the gain is only `1.13x`. `2 * n^3 / 8.309 s = 0.241 TFLOPs` vs the 0.25 TFLOPs FP64 peak = **96.4% of peak**. Step 4 will not move FP64 more than a couple of percent.
+
+## Hotspot
+Kernel is still 85-89% of total GPU time. The H2D + D2H share rises slightly compared to Step 1/2 (5.7% -> 9.1% in FP32, 3.7% -> 6.9% in FP64) **only because the kernel itself got faster**, not because the transfers got slower (they are essentially unchanged at 175/280 ms FP32 and 345/642 ms FP64). At the FP32 best of 3.05 s total, transfers are 14.9% of total, which is the first time they become non-negligible -- pinned host memory would help here, but we keep the host code simple.
+
+## Take-aways before moving to the tile-size sweep
+1. **Best so far: FP32 tiled TILE=16 -> 3.05 s total, 48.9x speedup vs `T_seq_best`, 57.5x kernel-only.** Already 1.4x faster than the best naive run, and 3.4x faster than the best OpenMP run on the i9 (14.36 s).
+2. **FP64 is essentially done**: 96% of FP64 peak. We will still report FP64 numbers for Step 4 and Step 5 for completeness, but the interesting story moves to FP32.
+3. **FP32 is bandwidth-bound at 78.6% of peak DRAM**: the only way to go faster on FP32 is to lift more reuse per byte. Step 4 sweeps `TILE = 8 / 16 / 32` to find that point, and Step 5 (cuBLAS) shows what a vendor-tuned implementation does (it uses register tiling on top of shared-memory tiling).
+4. The 0% L1/TEX hit rate is by design (shared-memory loads bypass L1) and is **not** evidence of a problem.
+
+# Fourth CUDA experiment: tile-size sweep on the tiled kernel
+Same `MatMulCudaTiled.cu`, recompiled with `-DTILE=8 / 16 / 32`. This is the direct CUDA counterpart of the existing CPU "blocking size 32 / 16 / 8" experiments (see "Sixth/Seventh/Eighth experiment MPI" sections above). The TILE controls two things at once: threads per block (`TILE x TILE`) and reuse-per-loaded-element (each shared element is read TILE times before being discarded).
+
+`n = 10000` divides evenly by 8 and 16 but not 32, so for `TILE=32` the experiment uses `n = 9984` (the closest multiple of 32). The work scales as `n^3`, giving a 0.48% smaller problem; we keep the raw measurement and additionally project the kernel/total time to a `n = 10000`-equivalent for the speedup table (factor `(10000/9984)^3 = 1.00481`).
+
+## Compile commands
+1. FP64: `nvcc -arch=sm_75 -O3            -DTILE={8,16}         MatMulCudaTiled.cu -o MatMulCudaTiled_fp64_t{8,16}`
+2. FP32: `nvcc -arch=sm_75 -O3 -DUSE_FLOAT -DTILE={8,16}         MatMulCudaTiled.cu -o MatMulCudaTiled_fp32_t{8,16}`
+3. FP64 t32: `nvcc -arch=sm_75 -O3            -DTILE=32 -DN=9984 MatMulCudaTiled.cu -o MatMulCudaTiled_fp64_t32`
+4. FP32 t32: `nvcc -arch=sm_75 -O3 -DUSE_FLOAT -DTILE=32 -DN=9984 MatMulCudaTiled.cu -o MatMulCudaTiled_fp32_t32`
+
+## Raw timings (Tesla T4, `nvprof` activity mode)
+| TILE | Precision | n     | H2D (ms) | Kernel (ms) | D2H (ms) | Total (ms) | Kernel % | C[0][0]    |
+|------|-----------|-------|----------|-------------|----------|------------|----------|------------|
+|  8   | FP64      | 10000 | 354.34   | 10181.41    | 541.66   | 11077.40   | 91.93%   | 60000.000  |
+| 16   | FP64      | 10000 | 353.52   |  8558.59    | 635.82   |  9547.94   | 89.66%   | 60000.000  |
+| 32   | FP64      |  9984 | 346.60   |  8623.76    | 561.12   |  9531.47   | 90.49%   | 59904.000  |
+|  8   | FP32      | 10000 | 201.99   |  4680.10    | 266.67   |  5148.76   | 90.92%   | 60000.000  |
+| 16   | FP32      | 10000 | 181.61   |  2856.06    | 274.33   |  3311.99   | 86.27%   | 60000.000  |
+| **32** | **FP32**| **9984** | **179.71** | **2133.58** | **329.15** | **2642.44** | **80.79%** | **59904.000** |
+
+(All runs verified -- expected `C[0][0] = 6 * n` -> 60000 at n=10000 and 59904 at n=9984.)
+
+## Speedup vs `T_seq_best = 149.13 s`
+Times for the n=9984 row are shown both as raw (n=9984, what the program actually measured) and as **scaled** to a n=10000-equivalent workload (raw / 0.99521) so all rows live on a single comparable axis.
+
+| TILE | Precision | n     | Total (s) | Speedup (total) | Kernel-only (s) | Speedup (kernel only) |
+|------|-----------|-------|-----------|-----------------|-----------------|------------------------|
+|  8   | FP64      | 10000 | 11.077    | 13.46x          | 10.181          | 14.65x                 |
+| 16   | FP64      | 10000 |  9.548    | 15.62x          |  8.559          | 17.42x                 |
+| 32   | FP64      |  9984 |  9.531    | 15.65x (raw)    |  8.624          | 17.29x (raw)           |
+| 32   | FP64      | 10000-equiv |  9.577 | 15.57x (scaled) | 8.665           | 17.21x (scaled)        |
+|  8   | FP32      | 10000 |  5.149    | 28.96x          |  4.680          | 31.86x                 |
+| 16   | FP32      | 10000 |  3.312    | 45.02x          |  2.856          | 52.21x                 |
+| **32** | **FP32**|  9984 |  **2.642**|  **56.45x (raw)** | **2.134**     | **69.88x (raw)**       |
+| **32** | **FP32**| **10000-equiv** | **2.655** | **56.17x (scaled)** | **2.144** | **69.56x (scaled)**       |
+
+ASCII speedup chart (vs `T_seq_best = 149.13 s`, total time, scaled where applicable):
+```
+fp64 t8     #############                          13.5x
+fp64 t16    ################                       15.6x
+fp64 t32    ################                       15.6x
+fp32 t8     #############################          29.0x
+fp32 t16    #############################################   45.0x
+fp32 t32    #########################################################   56.2x  <-- best tiled
+              |----+----|----+----|----+----|----+----|----+----|----+----|
+              0    5    10   15   20   25   30   35   40   45   50   55  60
+```
+
+## Effective TFLOPs and percentage of T4 peak
+| Variant         | Useful TFLOPs (kernel) | % of T4 peak |
+|-----------------|-------------------------|--------------|
+| FP64 tiled t8   | 0.196                   | 78.4% of FP64 peak (0.25) |
+| FP64 tiled t16  | 0.234                   | 93.6% of FP64 peak |
+| FP64 tiled t32  | 0.231                   | 92.4% of FP64 peak |
+| FP32 tiled t8   | 0.427                   | 5.3% of FP32 peak (8.1)  |
+| FP32 tiled t16  | 0.700                   | 8.6% of FP32 peak  |
+| **FP32 tiled t32**| **0.933**             | **11.5% of FP32 peak** |
+
+## Why TILE=32 wins for FP32 but not FP64 (consistent with Step 3)
+*   **FP32 (memory-bound)**: each shared-memory element is reused TILE times, so doubling TILE from 16 to 32 halves global-memory traffic per FLOP. The kernel was at 78.6% of peak DRAM bandwidth at t16 (Step 3 ncu numbers); at t32 we slide the bottleneck from DRAM toward compute and pick up another 33% in TFLOPs (0.700 -> 0.933). t8 is the worst because each element is reused only 8 times -> 4x the traffic of t32 -> firmly memory-bound. The trend `t8 < t16 < t32` is monotonic exactly as expected for a bandwidth-bound kernel.
+*   **FP64 (compute-bound)**: at t16 we already hit 93.6% of FP64 peak. Halving DRAM traffic with t32 cannot help because DRAM is not the bottleneck -- the FP64 ALU pipeline is. t32 is statistically tied with t16 (8624 ms vs 8559 ms is well within run-to-run variance). t8 is slightly worse (10181 ms) because at t8 we move enough traffic to start being limited by it again -- but the gap is much smaller than for FP32.
+
+The launch-geometry side effect is also clean: TILE=32 means 1024 threads/block (the maximum on T4), so only 1 block fits per SM. The achieved occupancy is still 100% in this case (1 block x 32 warps = 32 warps = max warps/SM), but that means we have **less margin**: any per-thread register increase would force occupancy down. For our simple kernel that does not happen, but it is why a textbook would push register tiling next instead of just bigger TILE.
+
+## Compare against the naive kernel at the same launch geometry
+*   FP32 naive BLOCK=32 kernel = 3786 ms vs FP32 tiled TILE=32 kernel = 2134 ms (raw, n=9984) -> tiling alone gives **1.77x kernel speedup at the same launch geometry**. This is the cleanest possible demonstration of the shared-memory reuse story: same threads, same blocks, same arithmetic; only difference is whether reads come from DRAM (with whatever cache help we get) or from explicit shared memory.
+*   FP64 naive BLOCK=16 kernel = 9356 ms vs FP64 tiled TILE=16 kernel = 8559 ms -> tiling gives only **1.09x** for FP64 at the same geometry. Confirms FP64 is compute-bound: explicit reuse cannot help because the bottleneck is downstream of the load path.
+
+## Hotspot
+Kernel share dropped from ~92% to **80.79% in the FP32 t32 winner** -- not because transfers got slower (they are essentially constant at ~180 ms H2D and ~330 ms D2H), but because the kernel has shrunk to 2.13 s. Transfers are now **18.4%** of total. To eat into that we would need pinned host memory (`cudaMallocHost`) and/or overlapping copies with compute via streams, but neither is necessary to make the speedup story.
+
+## Take-aways before moving to cuBLAS
+1. **Best hand-written CUDA so far: FP32 tiled TILE=32 -> 2.64 s total (n=9984), 56.2x speedup vs `T_seq_best`, 69.6x kernel-only.** That is **4.1x faster than the best OpenMP run** (14.36 s) and **5.2x faster than the best MPI run** (13.73 s) on the i9 -- on a different machine, so this is a cross-host claim, but it gives the right order of magnitude.
+2. **FP64 is locked at ~93% of T4 FP64 peak, both for TILE=16 and TILE=32.** No further hand-written kernel will move it without using tensor cores (which the T4 supports for FP64 only via WMMA + Turing limitations and is outside the "human-readable, simple" scope).
+3. **FP32 still has head-room to ~8x** (we are at 11.5% of FP32 peak). Closing that gap requires register tiling (each thread computes a `m x n` micro-tile of C, holding C values in registers across the full k-loop), which is exactly what cuBLAS does. Step 5 will show what we leave on the table by stopping at single-tile blocking.
+4. The TILE=32 result is at n=9984; we will use the *scaled* values (56.17x total, 69.56x kernel-only) when we put the final summary table together so all rows are on the same axis.

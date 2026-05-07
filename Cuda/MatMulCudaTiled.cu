@@ -14,7 +14,9 @@
 #include <stdlib.h>
 #include <cuda_runtime.h>
 
+#ifndef N
 #define N 10000        // n must be divisible by TILE for this simple version
+#endif
 
 #ifndef TILE
 #define TILE 16        // tile side; threads per block = TILE * TILE
